@@ -15,11 +15,36 @@
  */
 package com.squareup.wire.kotlin
 
-import com.squareup.kotlinpoet.*
+import com.squareup.kotlinpoet.ANY
+import com.squareup.kotlinpoet.AnnotationSpec
 import com.squareup.kotlinpoet.AnnotationSpec.UseSiteTarget.FIELD
-import com.squareup.kotlinpoet.KModifier.*
+import com.squareup.kotlinpoet.BOOLEAN
+import com.squareup.kotlinpoet.ClassName
+import com.squareup.kotlinpoet.CodeBlock
+import com.squareup.kotlinpoet.DOUBLE
+import com.squareup.kotlinpoet.FLOAT
+import com.squareup.kotlinpoet.FunSpec
+import com.squareup.kotlinpoet.INT
+import com.squareup.kotlinpoet.KModifier
+import com.squareup.kotlinpoet.KModifier.DATA
+import com.squareup.kotlinpoet.KModifier.OVERRIDE
+import com.squareup.kotlinpoet.KModifier.PRIVATE
+import com.squareup.kotlinpoet.LONG
+import com.squareup.kotlinpoet.MemberName
 import com.squareup.kotlinpoet.MemberName.Companion.member
+import com.squareup.kotlinpoet.NOTHING
+import com.squareup.kotlinpoet.NameAllocator
+import com.squareup.kotlinpoet.ParameterSpec
+import com.squareup.kotlinpoet.ParameterizedTypeName
 import com.squareup.kotlinpoet.ParameterizedTypeName.Companion.parameterizedBy
+import com.squareup.kotlinpoet.PropertySpec
+import com.squareup.kotlinpoet.STRING
+import com.squareup.kotlinpoet.TypeName
+import com.squareup.kotlinpoet.TypeSpec
+import com.squareup.kotlinpoet.asClassName
+import com.squareup.kotlinpoet.asTypeName
+import com.squareup.kotlinpoet.buildCodeBlock
+import com.squareup.kotlinpoet.joinToCode
 import com.squareup.kotlinpoet.jvm.jvmField
 import com.squareup.kotlinpoet.jvm.jvmStatic
 import com.squareup.wire.EnumAdapter
@@ -34,19 +59,30 @@ import com.squareup.wire.ProtoReader
 import com.squareup.wire.ProtoWriter
 import com.squareup.wire.WireField
 import com.squareup.wire.WireRpc
-import com.squareup.wire.schema.*
+import com.squareup.wire.schema.EnclosingType
+import com.squareup.wire.schema.EnumType
+import com.squareup.wire.schema.Field
+import com.squareup.wire.schema.MessageType
+import com.squareup.wire.schema.OneOf
 import com.squareup.wire.schema.Options.ENUM_VALUE_OPTIONS
+import com.squareup.wire.schema.ProtoFile
+import com.squareup.wire.schema.ProtoMember
+import com.squareup.wire.schema.ProtoType
+import com.squareup.wire.schema.Rpc
+import com.squareup.wire.schema.Schema
+import com.squareup.wire.schema.Service
+import com.squareup.wire.schema.Type
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.channels.SendChannel
 import okio.ByteString
 import okio.ByteString.Companion.encode
 import java.math.BigInteger
-import java.util.*
+import java.util.Locale
 
 class BindingGenerator private constructor(
     val schema: Schema,
-    private val nameToKotlinName: Map<ProtoType, ClassName>,
+    private val nameToKotlinName: Map<ProtoType, ClassNameWrap>,
     private val emitAndroid: Boolean,
     private val javaInterOp: Boolean,
     private val cakeAdapter: Boolean,
@@ -57,7 +93,9 @@ class BindingGenerator private constructor(
     private val nameAllocatorStore = mutableMapOf<Type, NameAllocator>()
 
     private val ProtoType.typeName
-        get() = nameToKotlinName.getValue(this)
+        get() = nameToKotlinName.getValue(this).className
+    private val ProtoType.packageName
+        get() = nameToKotlinName.getValue(this).packageName
     private val ProtoType.isEnum
         get() = schema.getType(this) is EnumType
     private val Type.typeName
@@ -66,6 +104,12 @@ class BindingGenerator private constructor(
         get() = type().typeName
     private val Type.typePbName
         get() = schema.protoFile(location().path).javaPackage()
+    private val Field.packageName
+        get() = if (isMap) {
+            valueType.packageName
+        } else {
+            type().packageName
+        }
 
     /** Returns the full name of the class generated for [type].  */
     fun generatedTypeName(type: Type) = type.typeName
@@ -113,8 +157,11 @@ class BindingGenerator private constructor(
 
         val rpcs = if (onlyRpc == null) service.rpcs() else listOf(onlyRpc)
         for (rpc in rpcs) {
-            builder.addFunction(generateRpcFunction(
-                rpc, service.name(), service.type().enclosingTypeOrPackage()))
+            builder.addFunction(
+                generateRpcFunction(
+                    rpc, service.name(), service.type().enclosingTypeOrPackage()
+                )
+            )
         }
 
         return builder.build()
@@ -130,10 +177,14 @@ class BindingGenerator private constructor(
         val wireRpcAnnotationSpec = AnnotationSpec.builder(WireRpc::class.asClassName())
             .addMember("path = %S", "/$packageName$serviceName/${rpc.name()}")
             // TODO(oldergod|jwilson) Lets' use Profile for this.
-            .addMember("requestAdapter = %S",
-                "$packageName${rpc.requestType().simpleName()}#ADAPTER")
-            .addMember("responseAdapter = %S",
-                "$packageName${rpc.responseType().simpleName()}#ADAPTER")
+            .addMember(
+                "requestAdapter = %S",
+                "$packageName${rpc.requestType().simpleName()}#ADAPTER"
+            )
+            .addMember(
+                "responseAdapter = %S",
+                "$packageName${rpc.responseType().simpleName()}#ADAPTER"
+            )
             .build()
         val funSpecBuilder = FunSpec.builder(rpc.name())
             .addModifiers(KModifier.ABSTRACT)
@@ -152,16 +203,19 @@ class BindingGenerator private constructor(
                         .addParameter("request", readableStreamOf(requestType))
                         .addParameter("response", writableStreamOf(responseType))
                 }
+
                 rpc.requestStreaming() -> {
                     funSpecBuilder
                         .addParameter("request", readableStreamOf(requestType))
                         .returns(responseType)
                 }
+
                 rpc.responseStreaming() -> {
                     funSpecBuilder
                         .addParameter("request", requestType)
                         .addParameter("response", writableStreamOf(responseType))
                 }
+
                 else -> {
                     funSpecBuilder
                         .addParameter("request", requestType)
@@ -173,11 +227,14 @@ class BindingGenerator private constructor(
                 rpc.requestStreaming() || rpc.responseStreaming() -> {
                     funSpecBuilder.returns(
                         GrpcStreamingCall::class.asClassName()
-                            .parameterizedBy(requestType, responseType))
+                            .parameterizedBy(requestType, responseType)
+                    )
                 }
+
                 else -> {
                     funSpecBuilder.returns(
-                        GrpcCall::class.asClassName().parameterizedBy(requestType, responseType))
+                        GrpcCall::class.asClassName().parameterizedBy(requestType, responseType)
+                    )
                 }
             }
         }
@@ -220,6 +277,7 @@ class BindingGenerator private constructor(
                             newName(constant.name, constant)
                         }
                     }
+
                     is MessageType -> {
                         newName("unknownFields", "unknownFields")
                         newName("ADAPTER", "ADAPTER")
@@ -231,8 +289,10 @@ class BindingGenerator private constructor(
                             newName("CREATOR", "CREATOR")
                         }
                         message.fieldsAndOneOfFields().forEach { field ->
-                            newName(field.compatibleGooglePbFieldName().snakeToLowerCamelCase(),
-                                field)
+                            newName(
+                                field.compatibleGooglePbFieldName().snakeToLowerCamelCase(),
+                                field
+                            )
                         }
                     }
                 }
@@ -259,19 +319,21 @@ class BindingGenerator private constructor(
 
         if (cakeAdapter) {
             // ============ 添加 cake 接口和函数 ===========
-            val protobufResponseParserClassName = ClassName("com.mico.cake.parser", "ProtobufResponseParser")
+            val protobufResponseParserClassName =
+                ClassName("com.mico.cake.parser", "ProtobufResponseParser")
             val typeSimpleName = type.type().simpleName()
             val pbPackageName = type.typePbName
             val pbClassName = ClassName(pbPackageName, typeSimpleName)
             classBuilder.addSuperinterface(
                 protobufResponseParserClassName.parameterizedBy(listOf(className, pbClassName))
             )
-            classBuilder.addFunction(FunSpec.builder("parseResponse")
-                .addModifiers(OVERRIDE)
-                .addParameter("message", pbClassName)
-                .addCode(CodeBlock.of("return convert(message)"))
-                .returns(className)
-                .build()
+            classBuilder.addFunction(
+                FunSpec.builder("parseResponse")
+                    .addModifiers(OVERRIDE)
+                    .addParameter("message", pbClassName)
+                    .addCode(CodeBlock.of("return convert(message)"))
+                    .returns(className)
+                    .build()
             )
         }
 
@@ -343,10 +405,16 @@ class BindingGenerator private constructor(
 
         if (!javaInterOp) {
             return funBuilder
-                .addAnnotation(AnnotationSpec.builder(Deprecated::class)
-                    .addMember("message = %S", "Shouldn't be used in Kotlin")
-                    .addMember("level = %T.%L", DeprecationLevel::class, DeprecationLevel.HIDDEN)
-                    .build())
+                .addAnnotation(
+                    AnnotationSpec.builder(Deprecated::class)
+                        .addMember("message = %S", "Shouldn't be used in Kotlin")
+                        .addMember(
+                            "level = %T.%L",
+                            DeprecationLevel::class,
+                            DeprecationLevel.HIDDEN
+                        )
+                        .build()
+                )
                 .returns(NOTHING)
                 .addStatement("throw %T()", ClassName("kotlin", "AssertionError"))
                 .build()
@@ -473,17 +541,23 @@ class BindingGenerator private constructor(
         val fieldNames = mutableListOf<String>()
         for (field in type.fieldsAndOneOfFields()) {
             val fieldName = nameAllocator[field]
-            result.addParameter(ParameterSpec.builder(fieldName, field.typeName)
-                .defaultValue("this.%N", fieldName)
-                .build())
+            result.addParameter(
+                ParameterSpec.builder(fieldName, field.typeName)
+                    .defaultValue("this.%N", fieldName)
+                    .build()
+            )
             fieldNames += fieldName
         }
-        result.addParameter(ParameterSpec.builder("unknownFields", ByteString::class)
-            .defaultValue("this.unknownFields")
-            .build())
+        result.addParameter(
+            ParameterSpec.builder("unknownFields", ByteString::class)
+                .defaultValue("this.unknownFields")
+                .build()
+        )
         fieldNames += "unknownFields"
-        result.addStatement("return %L", fieldNames
-            .joinToString(prefix = className.simpleName + "(", postfix = ")"))
+        result.addStatement(
+            "return %L", fieldNames
+                .joinToString(prefix = className.simpleName + "(", postfix = ")")
+        )
         return result.build()
     }
 
@@ -493,23 +567,31 @@ class BindingGenerator private constructor(
         builderClassName: ClassName
     ): TypeSpec {
         val builder = TypeSpec.classBuilder("Builder")
-            .superclass(Message.Builder::class.asTypeName()
-                .parameterizedBy(className, builderClassName))
+            .superclass(
+                Message.Builder::class.asTypeName()
+                    .parameterizedBy(className, builderClassName)
+            )
 
         if (!javaInterOp) {
             return builder
-                .primaryConstructor(FunSpec.constructorBuilder()
-                    .addParameter("message", className)
-                    .build())
-                .addProperty(PropertySpec.builder("message", className)
-                    .addModifiers(PRIVATE)
-                    .initializer("message")
-                    .build())
-                .addFunction(FunSpec.builder("build")
-                    .addModifiers(OVERRIDE)
-                    .returns(className)
-                    .addStatement("return message")
-                    .build())
+                .primaryConstructor(
+                    FunSpec.constructorBuilder()
+                        .addParameter("message", className)
+                        .build()
+                )
+                .addProperty(
+                    PropertySpec.builder("message", className)
+                        .addModifiers(PRIVATE)
+                        .initializer("message")
+                        .build()
+                )
+                .addFunction(
+                    FunSpec.builder("build")
+                        .addModifiers(OVERRIDE)
+                        .returns(className)
+                        .addStatement("return message")
+                        .build()
+                )
                 .build()
         }
 
@@ -584,9 +666,11 @@ class BindingGenerator private constructor(
             funBuilder.addKdoc("%L\n", field.documentation())
         }
         if (field.isDeprecated) {
-            funBuilder.addAnnotation(AnnotationSpec.builder(Deprecated::class)
-                .addMember("message = %S", "$fieldName is deprecated")
-                .build())
+            funBuilder.addAnnotation(
+                AnnotationSpec.builder(Deprecated::class)
+                    .addMember("message = %S", "$fieldName is deprecated")
+                    .build()
+            )
         }
         if (field.isRepeated) {
             val checkElementsNotNull =
@@ -633,7 +717,7 @@ class BindingGenerator private constructor(
             indent()
             val fields = type.fieldsAndOneOfFields()
             for (field in fields) {
-                val fieldName = nameAllocator[field].replace("_","")
+                val fieldName = nameAllocator[field].replace("_", "")
                 val itemType = if (field.isMap) {
                     field.valueType.typeName
                 } else {
@@ -641,21 +725,44 @@ class BindingGenerator private constructor(
                 }
                 if (field.isMap) {
                     if (field.valueType.isScalar) {
-                        add(
-                            "this.%1N = pb.%2N.mapValues { it.value }\n",
+                        addStatement(
+                            """
+                            if (pb.%2N.isNotEmpty()) {
+                                this.%1N = pb.%2N.mapValues { it.value }
+                            }
+                            """.trimIndent(),
                             fieldName,
                             fieldName
                         )
                     } else if (field.valueType.isEnum) {
-                        add(
-                            "this.%1N = pb.%2N.mapValues { %3T.fromValue(it.value.number) }\n",
+                        addStatement(
+                            """
+                            if (pb.%2N.isNotEmpty()) {
+                                this.%1N = pb.%2N.mapValues { %3T.fromValue(it.value.number) }
+                            }
+                            """.trimIndent(),
                             fieldName,
                             fieldName,
                             itemType
                         )
                     } else {
-                        add(
-                            "this.%1N = pb.%2N.mapValues { %3T.convert(it.value) }\n",
+                        val protoType = field.valueType
+                        val simpleName = protoType.simpleName()
+                        val packageName = protoType.packageName
+                        addStatement(
+                            """
+                            if (pb.%2N.isNotEmpty()) {
+                                this.%1N = buildMap {
+                                    val default = $packageName.$simpleName.getDefaultInstance()
+                                    pb.%2N.forEach { entry ->
+                                        val v = entry.value
+                                        if (v != default) {
+                                            %3T.convert(v)?.let { put(entry.key, it) }
+                                        }
+                                    }
+                                }
+                            }
+                            """.trimIndent(),
                             fieldName,
                             fieldName,
                             itemType
@@ -663,21 +770,39 @@ class BindingGenerator private constructor(
                     }
                 } else if (field.isRepeated) { // list
                     if (field.isScalar) {
-                        add(
-                            "this.%1N = pb.%2N.mapNotNull{it}\n",
+                        addStatement(
+                            """
+                            if (pb.%2N.isNotEmpty()) {
+                                this.%1N = pb.%2N.mapNotNull{ it }
+                            }
+                            """.trimIndent(),
                             fieldName,
                             fieldName
                         )
-                    } else if(field.type().isEnum){
-                        add(
-                            "this.%1N = pb.%2N.mapNotNull{%3T.fromValue(it.number)}\n",
+                    } else if (field.type().isEnum) {
+                        addStatement(
+                            """
+                            if (pb.%2N.isNotEmpty()) {
+                                this.%1N = pb.%2N.mapNotNull{%3T.fromValue(it.number)}
+                            }
+                            """.trimIndent(),
                             fieldName,
                             fieldName,
                             itemType
                         )
                     } else {
-                        add(
-                            "this.%1N = pb.%2N.mapNotNull{%3T.convert(it)}\n",
+                        val protoType = field.type()
+                        val simpleName = protoType.simpleName()
+                        val packageName = field.packageName
+                        addStatement(
+                            """
+                            if (pb.%2N.isNotEmpty()) {
+                                this.%1N = pb.%2N.mapNotNull {
+                                    it?.takeIf { it != $packageName.$simpleName.getDefaultInstance() }
+                                    ?.let { %3T.convert(it) }
+                                }
+                            }
+                            """.trimIndent(),
                             fieldName,
                             fieldName,
                             itemType
@@ -700,8 +825,15 @@ class BindingGenerator private constructor(
                         )
                     }
                 } else if (!field.isScalar) {
-                    add(
-                        "this.%1N = %2T.convert(pb.%3N)\n",
+                    val protoType = field.type()
+                    val simpleName = protoType.simpleName()
+                    val packageName = field.packageName
+                    addStatement(
+                        """
+                            if (pb.%1N != $packageName.$simpleName.getDefaultInstance()) {
+                                this.%1N = %2T.convert(pb.%3N)
+                            }
+                            """.trimIndent(),
                         fieldName,
                         itemType,
                         fieldName
@@ -738,7 +870,7 @@ class BindingGenerator private constructor(
 
         fields.forEach { field ->
             val fieldClass = field.typeName
-            val fieldName = nameAllocator[field].replace("_","")
+            val fieldName = nameAllocator[field].replace("_", "")
 
             val parameterSpec = ParameterSpec.builder(fieldName, fieldClass)
 //            if (!field.isRequired) {
@@ -758,15 +890,16 @@ class BindingGenerator private constructor(
             }
 
             constructorBuilder.addParameter(parameterSpec.build())
-            classBuilder.addProperty(PropertySpec.builder(fieldName, fieldClass)
-                .mutable()
-                .initializer(fieldName)
-                .apply {
-                    if (field.documentation().isNotBlank()) {
-                        addKdoc("%L\n", field.documentation())
+            classBuilder.addProperty(
+                PropertySpec.builder(fieldName, fieldClass)
+                    .mutable()
+                    .initializer(fieldName)
+                    .apply {
+                        if (field.documentation().isNotBlank()) {
+                            addKdoc("%L\n", field.documentation())
+                        }
                     }
-                }
-                .build())
+                    .build())
         }
 
 //    val unknownFields = nameAllocator["unknownFields"]
@@ -932,9 +1065,12 @@ class BindingGenerator private constructor(
             typeName == FLOAT -> CodeBlock.of("%Lf", defaultValue.toString())
             typeName == DOUBLE -> CodeBlock.of("%L", defaultValue.toString())
             typeName == STRING -> CodeBlock.of("%S", defaultValue)
-            typeName == ByteString::class.asTypeName() -> CodeBlock.of("%S.%M()!!",
+            typeName == ByteString::class.asTypeName() -> CodeBlock.of(
+                "%S.%M()!!",
                 defaultValue.toString().encode(charset = Charsets.ISO_8859_1).base64(),
-                ByteString.Companion::class.asClassName().member("decodeBase64"))
+                ByteString.Companion::class.asClassName().member("decodeBase64")
+            )
+
             protoType.isEnum -> CodeBlock.of("%T.%L", typeName, defaultValue)
             else -> throw IllegalStateException("$protoType is not an allowed scalar type")
         }
@@ -953,6 +1089,7 @@ class BindingGenerator private constructor(
                 string.substring("0x".length).toInt(radix = 16) // Hexadecimal.
             string.startsWith("0") && string != "0" ->
                 throw IllegalStateException("Octal literal unsupported $this")
+
             else -> BigInteger(string).toInt()
         }
     }
@@ -970,6 +1107,7 @@ class BindingGenerator private constructor(
                 string.substring("0x".length).toLong(radix = 16) // Hexadecimal.
             string.startsWith("0") && string != "0" ->
                 throw IllegalStateException("Octal literal unsupported $this")
+
             else -> BigInteger(string).toLong()
         }
     }
@@ -996,8 +1134,10 @@ class BindingGenerator private constructor(
 
         val adapterObject = TypeSpec.anonymousClassBuilder()
             .superclass(ProtoAdapter::class.asClassName().parameterizedBy(parentClassName))
-            .addSuperclassConstructorParameter("\n⇥%T.LENGTH_DELIMITED",
-                FieldEncoding::class.asClassName())
+            .addSuperclassConstructorParameter(
+                "\n⇥%T.LENGTH_DELIMITED",
+                FieldEncoding::class.asClassName()
+            )
             .addSuperclassConstructorParameter("\n%T::class\n⇤", parentClassName)
             .addFunction(encodedSizeFun(type))
             .addFunction(encodeFun(type))
@@ -1012,16 +1152,20 @@ class BindingGenerator private constructor(
 
         val adapterType = ProtoAdapter::class.asClassName().parameterizedBy(parentClassName)
 
-        companionObjBuilder.addProperty(PropertySpec.builder(adapterName, adapterType)
-            .jvmField()
-            .initializer("%L", adapterObject.build())
-            .build())
+        companionObjBuilder.addProperty(
+            PropertySpec.builder(adapterName, adapterType)
+                .jvmField()
+                .initializer("%L", adapterObject.build())
+                .build()
+        )
     }
 
     private fun Field.toProtoAdapterPropertySpec(): PropertySpec {
         val adapterType = ProtoAdapter::class.asTypeName()
-            .parameterizedBy(Map::class.asTypeName()
-                .parameterizedBy(keyType.typeName, valueType.typeName))
+            .parameterizedBy(
+                Map::class.asTypeName()
+                    .parameterizedBy(keyType.typeName, valueType.typeName)
+            )
 
         return PropertySpec.builder("${name()}Adapter", adapterType, PRIVATE)
             .initializer(
@@ -1041,11 +1185,13 @@ class BindingGenerator private constructor(
             message.fieldsAndOneOfFields().forEach { field ->
                 val adapterName = field.getAdapterName()
                 val fieldName = nameAllocator[field]
-                add("%L.%LencodedSizeWithTag(%L, value.%L) +\n",
+                add(
+                    "%L.%LencodedSizeWithTag(%L, value.%L) +\n",
                     adapterName,
                     if (field.isRepeated) "asRepeated()." else "",
                     field.tag(),
-                    fieldName)
+                    fieldName
+                )
             }
             add("value.unknownFields.size⇤\n")
         }
@@ -1065,11 +1211,13 @@ class BindingGenerator private constructor(
             message.fieldsAndOneOfFields().forEach { field ->
                 val adapterName = field.getAdapterName()
                 val fieldName = nameAllocator[field]
-                addStatement("%L.%LencodeWithTag(writer, %L, value.%L)",
+                addStatement(
+                    "%L.%LencodeWithTag(writer, %L, value.%L)",
                     adapterName,
                     if (field.isRepeated) "asRepeated()." else "",
                     field.tag(),
-                    fieldName)
+                    fieldName
+                )
             }
             addStatement("writer.writeBytes(value.unknownFields)")
         }
@@ -1083,7 +1231,7 @@ class BindingGenerator private constructor(
     }
 
     private fun decodeFun(message: MessageType): FunSpec {
-        val className = nameToKotlinName.getValue(message.type())
+        val className = nameToKotlinName.getValue(message.type()).className
         val nameAllocator = nameAllocator(message).copy()
 
         val declarationBody = buildCodeBlock {
@@ -1153,7 +1301,7 @@ class BindingGenerator private constructor(
     }
 
     private fun redactFun(message: MessageType): FunSpec {
-        val className = nameToKotlinName.getValue(message.type())
+        val className = nameToKotlinName.getValue(message.type()).className
         val nameAllocator = nameAllocator(message)
         val result = FunSpec.builder("redact")
             .addModifiers(OVERRIDE)
@@ -1188,9 +1336,11 @@ class BindingGenerator private constructor(
         return result
             .addStatement(
                 "return %L",
-                redactedFields.joinToCode(separator = ",\n",
+                redactedFields.joinToCode(
+                    separator = ",\n",
                     prefix = "value.copy(\n⇥",
-                    suffix = "\n⇤)")
+                    suffix = "\n⇤)"
+                )
             )
             .build()
     }
@@ -1239,6 +1389,7 @@ class BindingGenerator private constructor(
                 "%T$adapterFieldDelimiterName%L",
                 ProtoAdapter::class, simpleName().toUpperCase(Locale.US)
             )
+
             isMap -> throw IllegalArgumentException("Can't create single adapter for map type $this")
             else -> CodeBlock.of("%T${adapterFieldDelimiterName}ADAPTER", typeName)
         }
@@ -1272,35 +1423,43 @@ class BindingGenerator private constructor(
                 }
             }
 //        .addSuperinterface(WireEnum::class)
-            .primaryConstructor(FunSpec.constructorBuilder()
-                .addParameter(valueName, Int::class)
-                .build())
-            .addProperty(PropertySpec.builder(valueName, Int::class)
-                .initializer(valueName)
-                .build())
+            .primaryConstructor(
+                FunSpec.constructorBuilder()
+                    .addParameter(valueName, Int::class)
+                    .build()
+            )
+            .addProperty(
+                PropertySpec.builder(valueName, Int::class)
+                    .initializer(valueName)
+                    .build()
+            )
             .addType(generateEnumCompanion(message))
 
         message.constants().forEach { constant ->
-            builder.addEnumConstant(nameAllocator[constant], TypeSpec.anonymousClassBuilder()
-                .addSuperclassConstructorParameter("%L", constant.tag)
-                .apply {
-                    if (constant.documentation.isNotBlank()) {
-                        addKdoc("%L\n", constant.documentation)
+            builder.addEnumConstant(
+                nameAllocator[constant], TypeSpec.anonymousClassBuilder()
+                    .addSuperclassConstructorParameter("%L", constant.tag)
+                    .apply {
+                        if (constant.documentation.isNotBlank()) {
+                            addKdoc("%L\n", constant.documentation)
+                        }
+                        if (constant.options.get(ENUM_DEPRECATED) == "true") {
+                            addAnnotation(
+                                AnnotationSpec.builder(Deprecated::class)
+                                    .addMember("message = %S", "${constant.name} is deprecated")
+                                    .build()
+                            )
+                        }
                     }
-                    if (constant.options.get(ENUM_DEPRECATED) == "true") {
-                        addAnnotation(AnnotationSpec.builder(Deprecated::class)
-                            .addMember("message = %S", "${constant.name} is deprecated")
-                            .build())
-                    }
-                }
-                .build())
+                    .build())
         }
 
         return builder.build()
     }
 
     private fun generateEnumCompanion(message: EnumType): TypeSpec {
-        val parentClassName = nameToKotlinName.getValue(message.type()).copy(nullable = true)
+        val parentClassName =
+            nameToKotlinName.getValue(message.type()).className.copy(nullable = true)
         val nameAllocator = nameAllocator(message)
         val valueName = nameAllocator["value"]
         val fromValue = FunSpec.builder("fromValue")
@@ -1332,7 +1491,7 @@ class BindingGenerator private constructor(
      * ```
      */
     private fun generateEnumAdapter(message: EnumType): PropertySpec {
-        val parentClassName = nameToKotlinName.getValue(message.type())
+        val parentClassName = nameToKotlinName.getValue(message.type()).className
         val nameAllocator = nameAllocator(message)
 
         val adapterName = nameAllocator["ADAPTER"]
@@ -1342,12 +1501,14 @@ class BindingGenerator private constructor(
         val adapterObject = TypeSpec.anonymousClassBuilder()
             .superclass(EnumAdapter::class.asClassName().parameterizedBy(parentClassName))
             .addSuperclassConstructorParameter("\n⇥%T::class\n⇤", parentClassName)
-            .addFunction(FunSpec.builder("fromValue")
-                .addModifiers(OVERRIDE)
-                .addParameter(valueName, Int::class)
-                .returns(parentClassName)
-                .addStatement("return %T.fromValue(value)", parentClassName)
-                .build())
+            .addFunction(
+                FunSpec.builder("fromValue")
+                    .addModifiers(OVERRIDE)
+                    .addParameter(valueName, Int::class)
+                    .returns(parentClassName)
+                    .addStatement("return %T.fromValue(value)", parentClassName)
+                    .build()
+            )
             .build()
 
         return PropertySpec.builder(adapterName, adapterType)
@@ -1372,10 +1533,12 @@ class BindingGenerator private constructor(
         val creatorTypeName = ClassName("android.os", "Parcelable", "Creator")
             .parameterizedBy(parentClassName)
 
-        companionObjBuilder.addProperty(PropertySpec.builder(creatorName, creatorTypeName)
-            .jvmField()
-            .initializer("%T.newCreator(ADAPTER)", ANDROID_MESSAGE)
-            .build())
+        companionObjBuilder.addProperty(
+            PropertySpec.builder(creatorName, creatorTypeName)
+                .jvmField()
+                .initializer("%T.newCreator(ADAPTER)", ANDROID_MESSAGE)
+                .build()
+        )
     }
 
     private fun generateEnclosing(type: EnclosingType): TypeSpec {
@@ -1389,8 +1552,11 @@ class BindingGenerator private constructor(
 
     private fun Field.getDeclaration(allocatedName: String) = when {
         isRepeated -> CodeBlock.of("val $allocatedName = mutableListOf<%T>()", type().typeName)
-        isMap -> CodeBlock.of("val $allocatedName = mutableMapOf<%T, %T>()",
-            keyType.typeName, valueType.typeName)
+        isMap -> CodeBlock.of(
+            "val $allocatedName = mutableMapOf<%T, %T>()",
+            keyType.typeName, valueType.typeName
+        )
+
         else -> CodeBlock.of("var $allocatedName: %T = %L", declarationClass, defaultValue)
     }
 
@@ -1403,7 +1569,8 @@ class BindingGenerator private constructor(
     private fun ProtoType.asTypeName(): TypeName = when {
         isMap -> Map::class.asTypeName()
             .parameterizedBy(keyType().asTypeName(), valueType().asTypeName())
-        else -> nameToKotlinName.getValue(this)
+
+        else -> nameToKotlinName.getValue(this).className
     }
 
     private fun Field.getClass(baseClass: TypeName = type().asTypeName()) = when {
@@ -1420,6 +1587,7 @@ class BindingGenerator private constructor(
             defaultValue == CodeBlock.of("null") -> {
                 type().typeName.copy(nullable = true)
             }
+
             else -> type().typeName
         }
 
@@ -1427,26 +1595,26 @@ class BindingGenerator private constructor(
         get() = when {
             isRepeated -> CodeBlock.of("emptyList()")
             isMap -> CodeBlock.of("emptyMap()")
-            type() == ProtoType.BOOL ->CodeBlock.of("false")
-            type() == ProtoType.INT32  -> CodeBlock.of("0")
-            type() == ProtoType.FIXED32  -> CodeBlock.of("0")
-            type() == ProtoType.SINT32  -> CodeBlock.of("0")
-            type() == ProtoType.UINT32  -> CodeBlock.of("0")
-            type() == ProtoType.INT64  -> CodeBlock.of("0L")
-            type() == ProtoType.FIXED64  -> CodeBlock.of("0L")
-            type() == ProtoType.SINT64  -> CodeBlock.of("0L")
-            type() == ProtoType.UINT64  -> CodeBlock.of("0L")
-            type() == ProtoType.FIXED64  -> CodeBlock.of("0L")
-            type() == ProtoType.DOUBLE  -> CodeBlock.of("0.0")
-            type() == ProtoType.FLOAT  -> CodeBlock.of("0F")
-            type() == ProtoType.STRING  -> CodeBlock.of("\"\"")
+            type() == ProtoType.BOOL -> CodeBlock.of("false")
+            type() == ProtoType.INT32 -> CodeBlock.of("0")
+            type() == ProtoType.FIXED32 -> CodeBlock.of("0")
+            type() == ProtoType.SINT32 -> CodeBlock.of("0")
+            type() == ProtoType.UINT32 -> CodeBlock.of("0")
+            type() == ProtoType.INT64 -> CodeBlock.of("0L")
+            type() == ProtoType.FIXED64 -> CodeBlock.of("0L")
+            type() == ProtoType.SINT64 -> CodeBlock.of("0L")
+            type() == ProtoType.UINT64 -> CodeBlock.of("0L")
+            type() == ProtoType.FIXED64 -> CodeBlock.of("0L")
+            type() == ProtoType.DOUBLE -> CodeBlock.of("0.0")
+            type() == ProtoType.FLOAT -> CodeBlock.of("0F")
+            type() == ProtoType.STRING -> CodeBlock.of("\"\"")
             else -> CodeBlock.of("null")
         }
 
     companion object {
         private val BUILT_IN_TYPES = mapOf(
             ProtoType.BOOL to BOOLEAN,
-            ProtoType.BYTES to ClassName("com.google.protobuf","ByteString"),
+            ProtoType.BYTES to ClassName("com.google.protobuf", "ByteString"),
             ProtoType.DOUBLE to DOUBLE,
             ProtoType.FLOAT to FLOAT,
             ProtoType.FIXED32 to INT,
@@ -1479,29 +1647,48 @@ class BindingGenerator private constructor(
             rpcCallStyle: RpcCallStyle = RpcCallStyle.SUSPENDING,
             rpcRole: RpcRole = RpcRole.CLIENT
         ): BindingGenerator {
-            val map = BUILT_IN_TYPES.toMutableMap()
+            val map = BUILT_IN_TYPES.mapValues {
+                val className = it.value
+                ClassNameWrap(className.packageName, className)
+            }
+                .toMutableMap()
 
-            fun putAll(kotlinPackage: String, enclosingClassName: ClassName?, types: List<Type>) {
+            fun putAll(
+                originPackageName: String,
+                kotlinPackage: String,
+                enclosingClassName: ClassName?,
+                types: List<Type>
+            ) {
                 for (type in types) {
                     val className =
                         enclosingClassName?.nestedClass(type.type().simpleName() + postfix)
                             ?: ClassName(kotlinPackage, type.type().simpleName() + postfix)
-                    map[type.type()] = className
-                    putAll(kotlinPackage, className, type.nestedTypes())
+                    map[type.type()] = ClassNameWrap(originPackageName, className)
+                    putAll(originPackageName, kotlinPackage, className, type.nestedTypes())
                 }
             }
 
             for (protoFile in schema.protoFiles()) {
+                val originPackage = protoFile.origiPackage()
                 val kotlinPackage = protoFile.kotlinPackage()
-                putAll(kotlinPackage, null, protoFile.types())
+                putAll(originPackage, kotlinPackage, null, protoFile.types())
 
                 for (service in protoFile.services()) {
                     val className = ClassName(kotlinPackage, service.type().simpleName())
-                    map[service.type()] = className
+                    map[service.type()] = ClassNameWrap(originPackage, className)
                 }
             }
 
-            return BindingGenerator(schema, map, emitAndroid, javaInterop, cakeAdapter, fromRaw, rpcCallStyle, rpcRole)
+            return BindingGenerator(
+                schema,
+                map,
+                emitAndroid,
+                javaInterop,
+                cakeAdapter,
+                fromRaw,
+                rpcCallStyle,
+                rpcRole
+            )
         }
     }
 
@@ -1516,7 +1703,7 @@ class BindingGenerator private constructor(
     }
 
     private fun Field.compatibleGooglePbFieldName(): String {
-        if (isMap){
+        if (isMap) {
             return name() + "Map"
         } else if (isRepeated) {
             return name() + "List"
@@ -1529,6 +1716,7 @@ class BindingGenerator private constructor(
 }
 
 private fun ProtoFile.kotlinPackage() = javaPackage()?.toLowerCase() ?: packageName() ?: ""
+private fun ProtoFile.origiPackage() = javaPackage() ?: packageName() ?: ""
 
 // https://github.com/JetBrains/kotlin/blob/master/core/descriptors/src/org/jetbrains/kotlin/renderer/KeywordStringsGenerated.java
 private val KEYWORDS = setOf(
