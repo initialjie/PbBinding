@@ -87,6 +87,7 @@ class BindingGenerator private constructor(
     private val javaInterOp: Boolean,
     private val cakeAdapter: Boolean,
     private val fromRaw: Boolean,
+    private val convertOptExcludes: List<String>?,
     private val rpcCallStyle: RpcCallStyle,
     private val rpcRole: RpcRole
 ) {
@@ -749,15 +750,23 @@ class BindingGenerator private constructor(
                         val protoType = field.valueType
                         val simpleName = protoType.simpleName()
                         val packageName = protoType.packageName
+                        val contains = convertOptExcludes?.contains(simpleName) == true
                         addStatement(
                             """
                             if (pb.%2N.isNotEmpty()) {
                                 this.%1N = buildMap {
-                                    val default = $packageName.$simpleName.getDefaultInstance()
                                     pb.%2N.forEach { entry ->
                                         val v = entry.value
-                                        if (v != default) {
-                                            %3T.convert(v)?.let { put(entry.key, it) }
+                                        ${
+                                            if (contains) {
+                                                "%3T.convert(v)?.let { put(entry.key, it) }"
+                                            } else {
+                                                """
+                                                if (v != $packageName.$simpleName.getDefaultInstance()) {
+                                                    %3T.convert(v)?.let { put(entry.key, it) }
+                                                }   
+                                                """.trimIndent()
+                                            }
                                         }
                                     }
                                 }
@@ -794,12 +803,21 @@ class BindingGenerator private constructor(
                         val protoType = field.type()
                         val simpleName = protoType.simpleName()
                         val packageName = field.packageName
+                        val contains = convertOptExcludes?.contains(simpleName) == true
                         addStatement(
                             """
                             if (pb.%2N.isNotEmpty()) {
                                 this.%1N = pb.%2N.mapNotNull {
-                                    it?.takeIf { it != $packageName.$simpleName.getDefaultInstance() }
-                                    ?.let { %3T.convert(it) }
+                                    ${
+                                        if (contains) {
+                                            "%3T.convert(it)"
+                                        } else {
+                                            """
+                                            it?.takeIf { it != $packageName.$simpleName.getDefaultInstance() }
+                                                ?.let { %3T.convert(it) }
+                                            """.trimIndent()
+                                        }
+                                    }
                                 }
                             }
                             """.trimIndent(),
@@ -828,12 +846,17 @@ class BindingGenerator private constructor(
                     val protoType = field.type()
                     val simpleName = protoType.simpleName()
                     val packageName = field.packageName
+                    val contains = convertOptExcludes?.contains(simpleName) == true
                     addStatement(
-                        """
+                        if (contains) {
+                            "this.%1N = %2T.convert(pb.%3N)"
+                        } else {
+                            """
                             if (pb.%1N != $packageName.$simpleName.getDefaultInstance()) {
                                 this.%1N = %2T.convert(pb.%3N)
                             }
-                            """.trimIndent(),
+                            """.trimIndent()
+                        },
                         fieldName,
                         itemType,
                         fieldName
@@ -1644,6 +1667,7 @@ class BindingGenerator private constructor(
             javaInterop: Boolean = false,
             cakeAdapter: Boolean = false,
             fromRaw: Boolean = false,
+            convertOptExcludes: List<String>? = null,
             rpcCallStyle: RpcCallStyle = RpcCallStyle.SUSPENDING,
             rpcRole: RpcRole = RpcRole.CLIENT
         ): BindingGenerator {
@@ -1686,6 +1710,7 @@ class BindingGenerator private constructor(
                 javaInterop,
                 cakeAdapter,
                 fromRaw,
+                convertOptExcludes,
                 rpcCallStyle,
                 rpcRole
             )

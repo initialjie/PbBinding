@@ -84,22 +84,23 @@ import java.util.concurrent.Future
  * toString methods which are normally implemented with code generation.
  */
 class WireCompiler internal constructor(
-  val fs: FileSystem,
-  val log: WireLogger,
-  val protoPaths: List<String>,
-  val javaOut: String?,
-  val kotlinOut: String?,
-  val bindingOut: String?,
-  val sourceFileNames: List<String>,
-  val identifierSet: IdentifierSet,
-  val dryRun: Boolean,
-  val namedFilesOnly: Boolean,
-  val emitAndroid: Boolean,
-  val emitAndroidAnnotations: Boolean,
-  val emitCompact: Boolean,
-  val javaInterop: Boolean,
-  val cakeAdapter: Boolean,
-  val fromRaw: Boolean
+    val fs: FileSystem,
+    val log: WireLogger,
+    val protoPaths: List<String>,
+    val javaOut: String?,
+    val kotlinOut: String?,
+    val bindingOut: String?,
+    val sourceFileNames: List<String>,
+    val identifierSet: IdentifierSet,
+    val dryRun: Boolean,
+    val namedFilesOnly: Boolean,
+    val emitAndroid: Boolean,
+    val emitAndroidAnnotations: Boolean,
+    val emitCompact: Boolean,
+    val javaInterop: Boolean,
+    val cakeAdapter: Boolean,
+    val fromRaw: Boolean,
+    val convertOptExcludes: List<String>?
 ) {
 
   @Throws(IOException::class)
@@ -173,7 +174,7 @@ class WireCompiler internal constructor(
       }
 
       bindingOut != null -> {
-        val bindingGenerator = BindingGenerator(schema, emitAndroid, javaInterop, cakeAdapter, fromRaw)
+        val bindingGenerator = BindingGenerator(schema, emitAndroid, javaInterop, cakeAdapter, fromRaw, convertOptExcludes)
 
         // No services for Binding.
         val types = ConcurrentLinkedQueue(queue.filterIsInstance<PendingTypeFileSpec>())
@@ -208,6 +209,7 @@ class WireCompiler internal constructor(
     private const val KOTLIN_OUT_FLAG = "--kotlin_out="
     private const val BINDING_OUT_FLAG = "--binding_out="
     private const val CAKE_ADAPTER_FLAG = "--cake_adapter"
+    private const val CONVERT_OPT_EXCLUDES_FLAG = "--convert_opt_excludes="
     private const val FROM_RAW_FLAG = "--from_raw"
     private const val FILES_FLAG = "--files="
     private const val INCLUDES_FLAG = "--includes="
@@ -247,6 +249,7 @@ class WireCompiler internal constructor(
       val sourceFileNames = mutableListOf<String>()
       val identifierSetBuilder = IdentifierSet.Builder()
       val protoPaths = mutableListOf<String>()
+      var convertOptExcludes: List<String>? = null
       var javaOut: String? = null
       var kotlinOut: String? = null
       var bindingOut: String? = null
@@ -305,6 +308,10 @@ class WireCompiler internal constructor(
             identifierSetBuilder.exclude(excludes.split(Regex(",")))
           }
 
+          arg.startsWith(CONVERT_OPT_EXCLUDES_FLAG) -> {
+            convertOptExcludes = arg.substring(CONVERT_OPT_EXCLUDES_FLAG.length).split(",")
+          }
+
           arg == QUIET_FLAG -> quiet = true
           arg == DRY_RUN_FLAG -> dryRun = true
           arg == NAMED_FILES_ONLY -> namedFilesOnly = true
@@ -328,7 +335,7 @@ class WireCompiler internal constructor(
       return WireCompiler(
         fileSystem, logger, protoPaths, javaOut, kotlinOut, bindingOut, sourceFileNames,
         identifierSetBuilder.build(), dryRun, namedFilesOnly, emitAndroid, emitAndroidAnnotations,
-        emitCompact, javaInterop, cakeAdapter, fromRaw
+        emitCompact, javaInterop, cakeAdapter, fromRaw, convertOptExcludes
       )
     }
   }
