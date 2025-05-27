@@ -332,7 +332,7 @@ class BindingGenerator private constructor(
                 FunSpec.builder("parseResponse")
                     .addModifiers(OVERRIDE)
                     .addParameter("message", pbClassName)
-                    .addCode(CodeBlock.of("return convert(message)"))
+                    .addStatement("return convert(message)")
                     .returns(className)
                     .build()
             )
@@ -699,7 +699,7 @@ class BindingGenerator private constructor(
         companionBuilder: TypeSpec.Builder,
         nameAllocator: NameAllocator
     ) {
-        val className = generatedTypeName(type)
+//        val className = generatedTypeName(type)
         val typeSimpleName = type.type().simpleName()
         val pbPackageName = type.typePbName
         val pbClassName = ClassName(pbPackageName, typeSimpleName)
@@ -709,165 +709,109 @@ class BindingGenerator private constructor(
                 ParameterSpec.builder("pb", pbClassName).build()
             )
             .returns(type.typeName)
-        val fieldNames = mutableListOf<String>()
+//        val fieldNames = mutableListOf<String>()
 
         val body = buildCodeBlock {
-            add("val binding = %T()", type.typeName)
-                .add(".apply {")
-                .add("\n")
+            add("return %T(\n", type.typeName)
             indent()
-            val fields = type.fieldsAndOneOfFields()
-            for (field in fields) {
+            type.fieldsAndOneOfFields().forEach { field ->
                 val fieldName = nameAllocator[field].replace("_", "")
-                val itemType = if (field.isMap) {
-                    field.valueType.typeName
-                } else {
-                    field.type().typeName
-                }
-                if (field.isMap) {
-                    if (field.valueType.isScalar) {
-                        addStatement(
-                            """
-                            if (pb.%2N.isNotEmpty()) {
-                                this.%1N = pb.%2N.mapValues { it.value }
-                            }
-                            """.trimIndent(),
-                            fieldName,
-                            fieldName
-                        )
-                    } else if (field.valueType.isEnum) {
-                        addStatement(
-                            """
-                            if (pb.%2N.isNotEmpty()) {
-                                this.%1N = pb.%2N.mapValues { %3T.fromValue(it.value.number) }
-                            }
-                            """.trimIndent(),
-                            fieldName,
-                            fieldName,
-                            itemType
-                        )
-                    } else {
-                        val protoType = field.valueType
-                        val simpleName = protoType.simpleName()
-                        val packageName = protoType.packageName
-                        val contains = convertOptExcludes?.contains(simpleName) == true
-                        addStatement(
-                            """
-                            if (pb.%2N.isNotEmpty()) {
-                                this.%1N = buildMap {
-                                    pb.%2N.forEach { entry ->
-                                        val v = entry.value
-                                        ${
-                                            if (contains) {
-                                                "%3T.convert(v)?.let { put(entry.key, it) }"
-                                            } else {
-                                                """
-                                                if (v != $packageName.$simpleName.getDefaultInstance()) {
-                                                    %3T.convert(v)?.let { put(entry.key, it) }
-                                                }   
-                                                """.trimIndent()
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            """.trimIndent(),
-                            fieldName,
-                            fieldName,
-                            itemType
-                        )
+                val itemType = if (field.isMap) field.valueType.typeName else field.type().typeName
+
+                when {
+                    field.isMap -> {
+                        if (field.valueType.isScalar) {
+                            addStatement(
+                                "%1N = if (pb.%2N.isNotEmpty()) pb.%2N.mapValues { it.value } else emptyMap(),",
+                                fieldName, fieldName
+                            )
+                        } else if (field.valueType.isEnum) {
+                            addStatement(
+                                "%1N = if (pb.%2N.isNotEmpty()) pb.%2N.mapValues { %3T.fromValue(it.value.number) } else emptyMap(),",
+                                fieldName, fieldName, itemType
+                            )
+                        } else {
+                            addStatement(
+                                """
+                                |%1N = if (pb.%2N.isNotEmpty()) buildMap {
+                                |    pb.%2N.forEach { entry ->
+                                |        val v = entry.value
+                                |        %3T.convert(v)?.let { put(entry.key, it) }
+                                |    }
+                                |} else emptyMap(),
+                                """.trimMargin(),
+                                fieldName, fieldName, itemType
+                            )
+                        }
                     }
-                } else if (field.isRepeated) { // list
-                    if (field.isScalar) {
-                        addStatement(
-                            """
-                            if (pb.%2N.isNotEmpty()) {
-                                this.%1N = pb.%2N.mapNotNull{ it }
-                            }
-                            """.trimIndent(),
-                            fieldName,
-                            fieldName
-                        )
-                    } else if (field.type().isEnum) {
-                        addStatement(
-                            """
-                            if (pb.%2N.isNotEmpty()) {
-                                this.%1N = pb.%2N.mapNotNull{%3T.fromValue(it.number)}
-                            }
-                            """.trimIndent(),
-                            fieldName,
-                            fieldName,
-                            itemType
-                        )
-                    } else {
+
+                    field.isRepeated -> {
+                        if (field.isScalar) {
+                            addStatement(
+                                "%1N = if (pb.%2N.isNotEmpty()) pb.%2N.mapNotNull { it } else emptyList(),",
+                                fieldName, fieldName
+                            )
+                        } else if (field.type().isEnum) {
+                            addStatement(
+                                "%1N = if (pb.%2N.isNotEmpty()) pb.%2N.mapNotNull { %3T.fromValue(it.number) } else emptyList(),",
+                                fieldName, fieldName, itemType
+                            )
+                        } else {
+                            addStatement(
+                                """
+                                |%1N = if (pb.%1N.isNotEmpty())
+                                |    pb.%1N.mapNotNull { %2T.convert(it) }
+                                |else emptyList(),
+                                """.trimMargin(),
+                                fieldName, itemType
+                            )
+                        }
+                    }
+
+                    field.type().isEnum -> {
+                        if (field.isOptional) {
+                            addStatement(
+                                "%1N = %2T.fromValue(pb.%3N.number),",
+                                fieldName,
+                                itemType,
+                                field.name().snakeToLowerCamelCase()
+                            )
+                        } else {
+                            addStatement(
+                                "%1N = %2T.fromValue(pb.%1N),",
+                                fieldName,
+                                itemType
+                            )
+                        }
+                    }
+
+                    !field.isScalar -> {
                         val protoType = field.type()
                         val simpleName = protoType.simpleName()
-                        val packageName = field.packageName
                         val contains = convertOptExcludes?.contains(simpleName) == true
+                        val hasMethod = "has${fieldName.capitalize()}"
                         addStatement(
-                            """
-                            if (pb.%2N.isNotEmpty()) {
-                                this.%1N = pb.%2N.mapNotNull {
-                                    ${
-                                        if (contains) {
-                                            "%3T.convert(it)"
-                                        } else {
-                                            """
-                                            it?.takeIf { it != $packageName.$simpleName.getDefaultInstance() }
-                                                ?.let { %3T.convert(it) }
-                                            """.trimIndent()
-                                        }
-                                    }
-                                }
-                            }
-                            """.trimIndent(),
-                            fieldName,
-                            fieldName,
-                            itemType
+                            if (contains) {
+                                "%1N = %2T.convert(pb.%1N),"
+                            } else {
+                                """
+                                |%1N = if (pb.$hasMethod())
+                                |    %2T.convert(pb.%1N)
+                                |else null,
+                                """.trimMargin()
+                                },
+                            fieldName, itemType
                         )
                     }
-                } else if (field.type().isEnum) {
-                    if (field.isOptional) {
-                        add(
-                            "this.%1N = %2T.fromValue(pb.%3N.number)\n",
-                            fieldName,
-                            itemType,
-                            field.name().snakeToLowerCamelCase()
-                        )
-                    } else {
-                        add(
-                            "this.%1N = %2T.fromValue(pb.%3N)\n",
-                            fieldName,
-                            itemType,
-                            fieldName
-                        )
+
+                    else -> {
+                        addStatement("%1N = pb.%2N,", fieldName, fieldName)
                     }
-                } else if (!field.isScalar) {
-                    val protoType = field.type()
-                    val simpleName = protoType.simpleName()
-                    val packageName = field.packageName
-                    val contains = convertOptExcludes?.contains(simpleName) == true
-                    addStatement(
-                        if (contains) {
-                            "this.%1N = %2T.convert(pb.%3N)"
-                        } else {
-                            """
-                            if (pb.%1N != $packageName.$simpleName.getDefaultInstance()) {
-                                this.%1N = %2T.convert(pb.%3N)
-                            }
-                            """.trimIndent()
-                        },
-                        fieldName,
-                        itemType,
-                        fieldName
-                    )
-                } else {
-                    add("this.%1N = pb.%2N\n", fieldName, fieldName)
                 }
             }
             unindent()
-            add("} \n")
-            add("return %N", "binding")
+            add(")")
+            add("\n")
         }
         result.addCode(body)
         companionBuilder.addFunction(result.build())
@@ -915,7 +859,7 @@ class BindingGenerator private constructor(
             constructorBuilder.addParameter(parameterSpec.build())
             classBuilder.addProperty(
                 PropertySpec.builder(fieldName, fieldClass)
-                    .mutable()
+//                    .mutable()
                     .initializer(fieldName)
                     .apply {
                         if (field.documentation().isNotBlank()) {
