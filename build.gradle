@@ -24,7 +24,8 @@ buildscript {
       'mavenAnnotations': '3.5',
       'mavenPluginBuilder': '1.2.4',
       'mavenPublish': '0.8.0',
-      'releasedWire': '3.2.2'
+      'releasedWire': '3.2.2',
+      'kotlinxCollectionsImmutable': '0.3.4'
   ]
 
   ext.deps = [
@@ -69,6 +70,9 @@ buildscript {
           ],
           'coroutines': [
               'core': "org.jetbrains.kotlinx:kotlinx-coroutines-core:${versions.coroutines}"
+          ],
+          'collections': [
+              'immutable': "org.jetbrains.kotlinx:kotlinx-collections-immutable:${versions.kotlinxCollectionsImmutable}"
           ]
       ],
       'moshi': "com.squareup.moshi:moshi:${versions.moshi}",

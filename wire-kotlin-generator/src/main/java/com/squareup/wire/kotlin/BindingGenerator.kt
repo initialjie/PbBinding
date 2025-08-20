@@ -72,6 +72,8 @@ import com.squareup.wire.schema.Rpc
 import com.squareup.wire.schema.Schema
 import com.squareup.wire.schema.Service
 import com.squareup.wire.schema.Type
+import kotlinx.collections.immutable.ImmutableList
+import kotlinx.collections.immutable.ImmutableMap
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.channels.SendChannel
@@ -92,6 +94,13 @@ class BindingGenerator private constructor(
     private val rpcRole: RpcRole
 ) {
     private val nameAllocatorStore = mutableMapOf<Type, NameAllocator>()
+
+    // 不可变集合相关的MemberName常量
+    private val PERSISTENT_LIST_OF = MemberName("kotlinx.collections.immutable", "persistentListOf")
+    private val PERSISTENT_MAP_OF = MemberName("kotlinx.collections.immutable", "persistentMapOf")
+    private val PERSISTENT_SET_OF = MemberName("kotlinx.collections.immutable", "persistentSetOf")
+    private val TO_IMMUTABLE_LIST = MemberName("kotlinx.collections.immutable", "toImmutableList")
+    private val TO_IMMUTABLE_MAP = MemberName("kotlinx.collections.immutable", "toImmutableMap")
 
     private val ProtoType.typeName
         get() = nameToKotlinName.getValue(this).className
@@ -722,25 +731,27 @@ class BindingGenerator private constructor(
                     field.isMap -> {
                         if (field.valueType.isScalar) {
                             addStatement(
-                                "%1N = if (pb.%2N.isNotEmpty()) pb.%2N.mapValues { it.value } else emptyMap(),",
-                                fieldName, fieldName
+                                "%1N = if (pb.%1N.isNotEmpty()) pb.%1N.mapValues { it.value }.%2M() else %3M(),",
+                                fieldName, TO_IMMUTABLE_MAP, PERSISTENT_MAP_OF
                             )
                         } else if (field.valueType.isEnum) {
                             addStatement(
-                                "%1N = if (pb.%2N.isNotEmpty()) pb.%2N.mapValues { %3T.fromValue(it.value.number) } else emptyMap(),",
-                                fieldName, fieldName, itemType
+                                "%1N = if (pb.%1N.isNotEmpty()) pb.%1N.mapValues { %2T.fromValue(it.value.number) }.%3M() else %4M(),",
+                                fieldName, itemType, TO_IMMUTABLE_MAP, PERSISTENT_MAP_OF
                             )
                         } else {
                             addStatement(
                                 """
-                                |%1N = if (pb.%2N.isNotEmpty()) buildMap {
-                                |    pb.%2N.forEach { entry ->
+                                |%1N = if (pb.%1N.isNotEmpty()) buildMap {
+                                |    pb.%1N.forEach { entry ->
                                 |        val v = entry.value
-                                |        %3T.convert(v)?.let { put(entry.key, it) }
+                                |        %2T.convert(v)?.let { put(entry.key, it) }
                                 |    }
-                                |} else emptyMap(),
+                                |}.%3M()
+                                | else %4M(),
                                 """.trimMargin(),
-                                fieldName, fieldName, itemType
+
+                                fieldName, itemType, TO_IMMUTABLE_MAP, PERSISTENT_MAP_OF
                             )
                         }
                     }
@@ -748,22 +759,22 @@ class BindingGenerator private constructor(
                     field.isRepeated -> {
                         if (field.isScalar) {
                             addStatement(
-                                "%1N = if (pb.%2N.isNotEmpty()) pb.%2N.mapNotNull { it } else emptyList(),",
-                                fieldName, fieldName
+                                "%1N = if (pb.%1N.isNotEmpty()) pb.%1N.mapNotNull { it }.%2M() else %3M(),",
+                                fieldName, TO_IMMUTABLE_LIST, PERSISTENT_LIST_OF
                             )
                         } else if (field.type().isEnum) {
                             addStatement(
-                                "%1N = if (pb.%2N.isNotEmpty()) pb.%2N.mapNotNull { %3T.fromValue(it.number) } else emptyList(),",
-                                fieldName, fieldName, itemType
+                                "%1N = if (pb.%1N.isNotEmpty()) pb.%1N.mapNotNull { %2T.fromValue(it.number) }.%3M() else %4M(),",
+                                fieldName, itemType, TO_IMMUTABLE_LIST, PERSISTENT_LIST_OF
                             )
                         } else {
                             addStatement(
                                 """
                                 |%1N = if (pb.%1N.isNotEmpty())
-                                |    pb.%1N.mapNotNull { %2T.convert(it) }
-                                |else emptyList(),
+                                |    pb.%1N.mapNotNull { %2T.convert(it) }.%3M()
+                                |else %4M(),
                                 """.trimMargin(),
-                                fieldName, itemType
+                                fieldName, itemType, TO_IMMUTABLE_LIST, PERSISTENT_LIST_OF
                             )
                         }
                     }
@@ -799,13 +810,13 @@ class BindingGenerator private constructor(
                                 |    %2T.convert(pb.%1N)
                                 |else null,
                                 """.trimMargin()
-                                },
+                            },
                             fieldName, itemType
                         )
                     }
 
                     else -> {
-                        addStatement("%1N = pb.%2N,", fieldName, fieldName)
+                        addStatement("%1N = pb.%1N,", fieldName)
                     }
                 }
             }
@@ -1315,8 +1326,14 @@ class BindingGenerator private constructor(
     private fun Field.redact(fieldName: String): CodeBlock? {
         if (isRedacted) {
             return when {
-                isRepeated -> CodeBlock.of("emptyList()")
-                isMap -> CodeBlock.of("emptyMap()")
+                isRepeated -> {
+                    CodeBlock.of("%M()", PERSISTENT_LIST_OF)
+                }
+
+                isMap -> {
+                    CodeBlock.of("%M()", PERSISTENT_MAP_OF)
+                }
+
                 else -> CodeBlock.of("null")
             }
         } else if (!type().isScalar && !type().isEnum) {
@@ -1541,15 +1558,16 @@ class BindingGenerator private constructor(
     }
 
     private fun Field.getClass(baseClass: TypeName = type().asTypeName()) = when {
-        isRepeated -> List::class.asClassName().parameterizedBy(baseClass)
+        isRepeated -> ImmutableList::class.asClassName().parameterizedBy(baseClass)
         isOptional -> baseClass.copy(nullable = true)
         else -> baseClass.copy(nullable = false)
     }
 
     private val Field.typeName: TypeName
         get() = when {
-            isRepeated -> List::class.asClassName().parameterizedBy(type().typeName)
-            isMap -> Map::class.asTypeName().parameterizedBy(keyType.typeName, valueType.typeName)
+            isRepeated -> ImmutableList::class.asClassName().parameterizedBy(type().typeName)
+            isMap -> ImmutableMap::class.asTypeName()
+                .parameterizedBy(keyType.typeName, valueType.typeName)
 //            !isRequired -> type().typeName.copy(nullable = true)
             defaultValue == CodeBlock.of("null") -> {
                 type().typeName.copy(nullable = true)
@@ -1560,8 +1578,14 @@ class BindingGenerator private constructor(
 
     private val Field.defaultValue: CodeBlock
         get() = when {
-            isRepeated -> CodeBlock.of("emptyList()")
-            isMap -> CodeBlock.of("emptyMap()")
+            isRepeated -> {
+                CodeBlock.of("%M()", PERSISTENT_LIST_OF)
+            }
+
+            isMap -> {
+                CodeBlock.of("%M()", PERSISTENT_MAP_OF)
+            }
+
             type() == ProtoType.BOOL -> CodeBlock.of("false")
             type() == ProtoType.INT32 -> CodeBlock.of("0")
             type() == ProtoType.FIXED32 -> CodeBlock.of("0")
